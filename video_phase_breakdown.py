@@ -208,15 +208,44 @@ def transcribe_audio(wav_path: Path, cache_path: Path, whisper_model: str) -> li
 
 def extract_frames(video_path: Path, frames_dir: Path, threshold: float) -> list:
     """Extract frames on scene-change, return sorted list of timestamps (sec)
-    aligned with frame_0001.png, frame_0002.png, ..."""
+    aligned with frame_0001.png, frame_0002.png, ... Falls back to fixed-
+    interval sampling if scene-change detection finds nothing (common with
+    screen recordings, where deltas are often too subtle to cross a scene
+    threshold even though on-screen content is meaningfully changing)."""
     frames_dir.mkdir(parents=True, exist_ok=True)
     existing = sorted(frames_dir.glob("frame_*.png"))
     ts_cache = frames_dir / "timestamps.json"
     if existing and ts_cache.exists():
-        log(f"Using {len(existing)} previously extracted frames.")
-        return json.loads(ts_cache.read_text())
+        cached = json.loads(ts_cache.read_text())
+        if cached:  # non-empty cache only -- an empty result isn't "done"
+            log(f"Using {len(existing)} previously extracted frames.")
+            return cached
+        log("Previous frame extraction produced 0 frames -- retrying.")
 
-    log(f"Extracting scene-change frames (threshold={threshold})...")
+    timestamps = _extract_frames_scene_change(video_path, frames_dir, threshold)
+
+    if not timestamps:
+        log(
+            f"No scene changes detected at threshold={threshold}. Retrying "
+            f"at a lower threshold ({threshold / 3:.3f}) -- typical for "
+            f"screen recordings with subtle frame-to-frame deltas."
+        )
+        timestamps = _extract_frames_scene_change(video_path, frames_dir, threshold / 3)
+
+    if not timestamps:
+        log("Still no scene changes found -- falling back to fixed-interval sampling (every 5s).")
+        timestamps = _extract_frames_fixed_interval(video_path, frames_dir, interval_sec=5)
+
+    ts_cache.write_text(json.dumps(timestamps, indent=2))
+    log(f"Extracted {len(timestamps)} frames total.")
+    return timestamps
+
+
+def _extract_frames_scene_change(video_path: Path, frames_dir: Path, threshold: float) -> list:
+    # Clear any partial frames from a prior attempt at a different threshold.
+    for f in frames_dir.glob("frame_*.png"):
+        f.unlink()
+
     cmd = [
         "ffmpeg", "-y", "-i", str(video_path),
         "-vf", f"select='gt(scene,{threshold})',showinfo",
@@ -225,24 +254,34 @@ def extract_frames(video_path: Path, frames_dir: Path, threshold: float) -> list
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
 
-    # Parse pts_time values out of showinfo stderr output, in order emitted.
-    timestamps = [
-        float(m) for m in re.findall(r"pts_time:([\d.]+)", proc.stderr)
-    ]
-
+    timestamps = [float(m) for m in re.findall(r"pts_time:([\d.]+)", proc.stderr)]
     frame_files = sorted(frames_dir.glob("frame_*.png"))
+
+    if not frame_files:
+        return []
+
     if len(timestamps) != len(frame_files):
-        # Fallback: if counts mismatch (can happen on some ffmpeg builds),
-        # space frames evenly across the video duration rather than fail.
         log("WARNING: timestamp/frame count mismatch, estimating timestamps.")
         duration = get_video_duration(video_path)
         n = len(frame_files)
         timestamps = [round(i * duration / max(n - 1, 1), 2) for i in range(n)]
 
-    # Always make sure timestamp 0 is represented for context.
-    ts_cache.write_text(json.dumps(timestamps, indent=2))
-    log(f"Extracted {len(frame_files)} frames.")
     return timestamps
+
+
+def _extract_frames_fixed_interval(video_path: Path, frames_dir: Path, interval_sec: int) -> list:
+    for f in frames_dir.glob("frame_*.png"):
+        f.unlink()
+
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vf", f"fps=1/{interval_sec}",
+        str(frames_dir / "frame_%04d.png"),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+    frame_files = sorted(frames_dir.glob("frame_*.png"))
+    return [round(i * interval_sec, 2) for i in range(len(frame_files))]
 
 
 def get_video_duration(video_path: Path) -> float:
@@ -261,8 +300,10 @@ def describe_frames(
     frames_dir: Path, timestamps: list, cache_path: Path, vision_model: str
 ) -> list:
     if cache_path.exists():
-        log(f"Loading cached frame descriptions -> {cache_path.name}")
-        return json.loads(cache_path.read_text())
+        cached = json.loads(cache_path.read_text())
+        if cached:  # non-empty cache only -- an empty result isn't "done"
+            log(f"Loading cached frame descriptions -> {cache_path.name}")
+            return cached
 
     frame_files = sorted(frames_dir.glob("frame_*.png"))
     log(f"Describing {len(frame_files)} frames with {vision_model}...")
