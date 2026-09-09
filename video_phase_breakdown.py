@@ -169,7 +169,7 @@ def extract_audio(video_path: Path, out_wav: Path) -> None:
 def transcribe_audio(wav_path: Path, cache_path: Path, whisper_model: str) -> list:
     if cache_path.exists():
         log(f"Loading cached transcript -> {cache_path.name}")
-        return json.loads(cache_path.read_text())
+        return json.loads(cache_path.read_text(encoding="utf-8"))
 
     log(f"Transcribing with faster-whisper ({whisper_model}, GPU if available)...")
     add_windows_cuda_dll_dirs()
@@ -197,7 +197,7 @@ def transcribe_audio(wav_path: Path, cache_path: Path, whisper_model: str) -> li
         {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
         for s in segments
     ]
-    cache_path.write_text(json.dumps(result, indent=2))
+    cache_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     log(f"Transcribed {len(result)} segments.")
     return result
 
@@ -216,7 +216,7 @@ def extract_frames(video_path: Path, frames_dir: Path, threshold: float) -> list
     existing = sorted(frames_dir.glob("frame_*.png"))
     ts_cache = frames_dir / "timestamps.json"
     if existing and ts_cache.exists():
-        cached = json.loads(ts_cache.read_text())
+        cached = json.loads(ts_cache.read_text(encoding="utf-8"))
         if cached:  # non-empty cache only -- an empty result isn't "done"
             log(f"Using {len(existing)} previously extracted frames.")
             return cached
@@ -236,7 +236,7 @@ def extract_frames(video_path: Path, frames_dir: Path, threshold: float) -> list
         log("Still no scene changes found -- falling back to fixed-interval sampling (every 5s).")
         timestamps = _extract_frames_fixed_interval(video_path, frames_dir, interval_sec=5)
 
-    ts_cache.write_text(json.dumps(timestamps, indent=2))
+    ts_cache.write_text(json.dumps(timestamps, indent=2), encoding="utf-8")
     log(f"Extracted {len(timestamps)} frames total.")
     return timestamps
 
@@ -300,7 +300,7 @@ def describe_frames(
     frames_dir: Path, timestamps: list, cache_path: Path, vision_model: str
 ) -> list:
     if cache_path.exists():
-        cached = json.loads(cache_path.read_text())
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
         if cached:  # non-empty cache only -- an empty result isn't "done"
             log(f"Loading cached frame descriptions -> {cache_path.name}")
             return cached
@@ -326,19 +326,25 @@ def describe_frames(
             "images": [img_b64],
             "stream": False,
         }
-        try:
-            resp = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=120)
-            resp.raise_for_status()
-            description = resp.json().get("response", "").strip()
-        except requests.exceptions.RequestException as e:
-            log(f"  Frame {i} failed ({e}), skipping.")
-            description = "[description failed]"
+        description = None
+        for attempt in range(2):  # one retry on timeout/connection error
+            try:
+                resp = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=300)
+                resp.raise_for_status()
+                description = resp.json().get("response", "").strip()
+                break
+            except requests.exceptions.RequestException as e:
+                if attempt == 0:
+                    log(f"  Frame {i} timed out, retrying once ({e})...")
+                else:
+                    log(f"  Frame {i} failed after retry ({e}), skipping.")
+                    description = "[description failed]"
 
         results.append({"timestamp": ts, "description": description})
         if i % 10 == 0 or i == len(frame_files):
             log(f"  {i}/{len(frame_files)} frames described.")
 
-    cache_path.write_text(json.dumps(results, indent=2))
+    cache_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
     return results
 
 
@@ -473,13 +479,13 @@ def main():
 
     # Step 3
     timeline = build_timeline(transcript, frame_descs)
-    (args.outdir / "timeline.txt").write_text(timeline)
+    (args.outdir / "timeline.txt").write_text(timeline, encoding="utf-8")
     log(f"Merged timeline written -> {args.outdir / 'timeline.txt'}")
 
     # Step 4
     breakdown = synthesize_breakdown(timeline, synthesis_model, args.outdir)
     out_md = args.outdir / "phase_breakdown.md"
-    out_md.write_text(breakdown)
+    out_md.write_text(breakdown, encoding="utf-8")
     log(f"Done. Phase breakdown written -> {out_md}")
 
 
